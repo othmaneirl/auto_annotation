@@ -20,9 +20,13 @@ DetectionMap = Dict[str, List[Dict]]  # image_path -> list of detection dicts
 def image_uncertainty_score(detections: List[Dict]) -> float:
     """Compute an uncertainty score for a single image.
 
-    The score is the *average detection confidence* (lower → more uncertain).
-    Images with **no detections** receive a score of ``0.0``, making them the
-    most uncertain (the model found nothing to be confident about).
+    Images **with** detections are scored by their average confidence
+    (lower confidence → more uncertain → reviewed first).
+
+    Images with **no detections** receive a score of ``2.0`` so they are
+    placed *after* images that have some predictions the user can correct.
+    Reviewing images where the model already drew boxes is far more
+    productive than starting annotation from scratch.
 
     Parameters
     ----------
@@ -33,10 +37,11 @@ def image_uncertainty_score(detections: List[Dict]) -> float:
     Returns
     -------
     float
-        Average confidence in ``[0, 1]``.  Returns ``0.0`` for empty lists.
+        Average confidence in ``[0, 1]`` for images with detections, or
+        ``2.0`` for images with none.
     """
     if not detections:
-        return 0.0
+        return 2.0  # push "nothing detected" to the back
     return sum(d["confidence"] for d in detections) / len(detections)
 
 
@@ -148,7 +153,7 @@ def auto_annotate_batch(
         annotator.save_annotations(path, detections, img_w, img_h)
         results[path] = detections
 
-        if idx % 100 == 0:
+        if idx % 10 == 0 or idx == len(subset):
             logger.info("Auto-annotated %d / %d images …", idx, len(subset))
 
     logger.info("Auto-annotation complete: %d images processed.", len(results))

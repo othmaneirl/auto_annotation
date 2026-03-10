@@ -111,7 +111,7 @@ class Pipeline:
 
     STATE_FILE = "pipeline_state.json"
 
-    def __init__(self, config: Optional[PipelineConfig] = None) -> None:
+    def __init__(self, config: Optional[PipelineConfig] = None, fresh: bool = False) -> None:
         self.config = config or PipelineConfig()
         self._setup_dirs()
 
@@ -131,7 +131,10 @@ class Pipeline:
         # Images currently queued for user review
         self._review_queue: List[str] = []
 
-        self._load_state()
+        if not fresh:
+            self._load_state()
+        else:
+            logger.info("Fresh pipeline – skipping state restore.")
 
     # ------------------------------------------------------------------
     # Setup helpers
@@ -176,6 +179,13 @@ class Pipeline:
             self.tracker.model_versions = state.get("model_versions", [])
             self._review_queue = state.get("review_queue", [])
             logger.info("Pipeline state restored from %s", p)
+
+            # If a fine-tuned model exists, point the detector at it so that
+            # subsequent inference uses the best available weights.
+            latest = self.tracker.latest_model
+            if latest and Path(latest).exists():
+                self.detector.model_path = latest
+                logger.info("Detector model path updated to fine-tuned: %s", latest)
         except Exception as exc:
             logger.warning("Could not load pipeline state: %s", exc)
 

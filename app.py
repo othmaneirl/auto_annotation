@@ -144,7 +144,7 @@ def setup_pipeline(
         base_model=model_name.strip(),
         conf_threshold=float(conf_threshold),
     )
-    p = Pipeline(config=config)
+    p = Pipeline(config=config, fresh=True)
     _set_pipeline(p)
 
     msg = [f"✅ Pipeline initialised (model: {model_name}, threshold: {conf_threshold})."]
@@ -425,22 +425,27 @@ def run_training(epochs_override: int, device: str) -> str:
     return f"✅ Training complete.\nBest model: `{best_pt}`\nCurrent round: {p.tracker.round_number}"
 
 
-def run_auto_annotation() -> str:
+def run_auto_annotation():
     p = _get_pipeline()
     if p is None:
-        return "❌ Pipeline not initialised."
+        yield "❌ Pipeline not initialised."
+        return
 
     from utils import collect_images
 
     images = collect_images(p.config.unlabeled_dir)
     if not images:
-        return "⚠️ No images found in the unlabeled directory."
+        yield "⚠️ No images found in the unlabeled directory."
+        return
+
+    yield f"⏳ Running auto-annotation on ~{len(images)} images …\n(model: {p.detector.model_path})"
 
     try:
         queue = p.run_initial_detection()
     except Exception as exc:
         logger.exception("Auto-annotation failed")
-        return f"❌ Auto-annotation failed: {exc}"
+        yield f"❌ Auto-annotation failed: {exc}"
+        return
 
     _session.review_images = queue
     _session.current_index = 0
@@ -450,7 +455,7 @@ def run_auto_annotation() -> str:
         _session.annotations[path] = dets
 
     summary = p.summary()
-    return (
+    yield (
         f"✅ Auto-annotation complete.\n"
         f"Round: {summary['round']}\n"
         f"Images queued for review: {summary['review_queue_size']}\n"

@@ -119,17 +119,27 @@ class Trainer:
         if device:
             train_kwargs["device"] = device
 
-        model.train(**train_kwargs)
+        results = model.train(**train_kwargs)
 
-        best_pt = run_dir / "weights" / "best.pt"
+        # Try to get the save directory from the training results first
+        best_pt = None
+        if results and hasattr(results, 'save_dir'):
+            candidate = Path(results.save_dir) / "weights" / "best.pt"
+            if candidate.exists():
+                best_pt = candidate
+
+        # Fallback: check expected location
+        if best_pt is None or not best_pt.exists():
+            best_pt = run_dir / "weights" / "best.pt"
+
         if not best_pt.exists():
-            # ultralytics sometimes appends a suffix when exist_ok=True
-            candidates = list(self.project_dir.glob(f"{run_name}*/weights/best.pt"))
+            # Broad search: ultralytics may nest under detect/ or other task dirs
+            candidates = list(self.project_dir.rglob(f"*{run_name}*/weights/best.pt"))
             if candidates:
                 best_pt = sorted(candidates)[-1]
             else:
                 raise RuntimeError(
-                    f"Training finished but best.pt not found under {run_dir}"
+                    f"Training finished but best.pt not found under {self.project_dir}"
                 )
 
         logger.info("Training complete. Best model: %s", best_pt)
