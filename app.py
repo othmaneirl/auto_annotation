@@ -51,13 +51,40 @@ def _set_pipeline(p):
 
 
 # ---------------------------------------------------------------------------
-# Helper: draw boxes on an image and return a PIL image
+# Display-size constants – images are resized to fit within these dimensions
+# so the <img> element has NO object-fit letterboxing.  Coordinates drawn
+# on the display image are scaled back to original pixels via _session.scale.
 # ---------------------------------------------------------------------------
+DISPLAY_MAX_W = 960
+DISPLAY_MAX_H = 640
+
 
 def _render_image(image_path: str, annotations: List[Dict]) -> Optional["PIL.Image.Image"]:
+    """Draw boxes on the image, then resize to display dimensions.
+
+    Also updates ``_session.scale`` so drawn coordinates can be mapped
+    back to origin pixel space.
+    """
     try:
         from utils import draw_boxes
-        return draw_boxes(image_path, annotations)
+        from PIL import Image
+
+        full = draw_boxes(image_path, annotations)
+        orig_w, orig_h = full.size
+
+        # Scale to fit display box while keeping aspect ratio
+        ratio = min(DISPLAY_MAX_W / orig_w, DISPLAY_MAX_H / orig_h, 1.0)
+        new_w = max(1, int(orig_w * ratio))
+        new_h = max(1, int(orig_h * ratio))
+
+        if ratio < 1.0:
+            display = full.resize((new_w, new_h), Image.LANCZOS)
+        else:
+            display = full  # already small enough
+
+        # Store scale so we can convert drawn coords → original coords
+        _session.scale = orig_w / new_w  # same as orig_h / new_h
+        return display
     except Exception as exc:
         logger.warning("Could not render image %s: %s", image_path, exc)
         return None
@@ -75,6 +102,7 @@ class SessionState:
         self.current_index: int = 0
         self.annotations: Dict[str, List[Dict]] = {}
         self.pipeline_running: bool = False
+        self.scale: float = 1.0  # display→original pixel multiplier
 
     def current_image(self) -> Optional[str]:
         if 0 <= self.current_index < len(self.review_images):
@@ -319,15 +347,18 @@ def add_annotation(annotation_json: str, new_class: str, coords_str: str) -> Tup
     """
     anns = _parse_anns(annotation_json)
 
-    # Parse coordinates
+    # Parse coordinates (these are in DISPLAY pixel space)
     parts = [p.strip() for p in coords_str.replace(";", ",").split(",") if p.strip()]
     if len(parts) < 4:
-        # Not enough coordinates — return unchanged
         return _edit_result(anns)
     try:
         x1, y1, x2, y2 = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
     except ValueError:
         return _edit_result(anns)
+
+    # Scale display coords → original image coords
+    s = _session.scale
+    x1, y1, x2, y2 = x1 * s, y1 * s, x2 * s, y2 * s
 
     cls = new_class.strip() if new_class else "object"
     new_ann = {"bbox": [x1, y1, x2, y2], "class": cls, "confidence": 1.0}
@@ -482,27 +513,14 @@ def export_model() -> Optional[str]:
 
 _BBOX_DRAW_JS = """
 () => {
-    if (window._bboxCanvasReady) return;
-    window._bboxCanvasReady = true;
+    // Version-gated: force re-init when code changes
+    if (window._bboxVer === 3) return;
+    window._bboxVer = 3;
     window._drawnCoords = '';
 
-    // Compute the actual rendered image area inside the <img> element,
-    // accounting for object-fit: contain letterboxing.
-    function getRenderedRect(img) {
-        const iw = img.naturalWidth, ih = img.naturalHeight;
-        const el = img.getBoundingClientRect();
-        const ew = el.width, eh = el.height;
-        const imgAR = iw / ih, elAR = ew / eh;
-        let rw, rh, ox, oy;
-        if (imgAR > elAR) {
-            rw = ew;  rh = ew / imgAR;
-            ox = 0;   oy = (eh - rh) / 2;
-        } else {
-            rh = eh;  rw = eh * imgAR;
-            oy = 0;   ox = (ew - rw) / 2;
-        }
-        return { rw, rh, ox, oy, elLeft: el.left, elTop: el.top };
-    }
+    // Remove any old overlay & listeners from previous version
+    const oldOv = document.getElementById('bbox-overlay');
+    if (oldOv) oldOv.remove();
 
     function setupOverlay() {
         const container = document.querySelector('#review-image-container');
@@ -518,81 +536,84 @@ _BBOX_DRAW_JS = """
         const old = document.getElementById('bbox-overlay');
         if (old) old.remove();
 
+        // The Python side pre-resizes images so naturalWidth == displayed width.
+        // We place the canvas exactly over the <img>, using getBoundingClientRect
+        // for precise positioning.
         const overlay = document.createElement('canvas');
         overlay.id = 'bbox-overlay';
         overlay.style.pointerEvents = 'all';
         overlay.style.cursor = 'crosshair';
         overlay.style.zIndex = '100';
+        overlay.style.position = 'absolute';
 
         const imgWrapper = img.parentElement;
         imgWrapper.style.position = 'relative';
 
         function positionCanvas() {
-            const elRect = img.getBoundingClientRect();
-            const wrapRect = imgWrapper.getBoundingClientRect();
-            const rr = getRenderedRect(img);
-            // Position overlay exactly over the rendered image content
-            overlay.style.position = 'absolute';
-            overlay.style.left = (elRect.left - wrapRect.left + rr.ox) + 'px';
-            overlay.style.top = (elRect.top - wrapRect.top + rr.oy) + 'px';
-            overlay.width = Math.round(rr.rw);
-            overlay.height = Math.round(rr.rh);
-            overlay.style.width = rr.rw + 'px';
-            overlay.style.height = rr.rh + 'px';
+            const imgR = img.getBoundingClientRect();
+            const wrapR = imgWrapper.getBoundingClientRect();
+            overlay.style.left = (imgR.left - wrapR.left) + 'px';
+            overlay.style.top  = (imgR.top  - wrapR.top)  + 'px';
+            overlay.width  = Math.round(imgR.width);
+            overlay.height = Math.round(imgR.height);
+            overlay.style.width  = imgR.width  + 'px';
+            overlay.style.height = imgR.height + 'px';
         }
         positionCanvas();
         imgWrapper.appendChild(overlay);
 
         const ctx = overlay.getContext('2d');
-        let drawing = false, startX = 0, startY = 0;
+        let drawing = false, sx = 0, sy = 0;
+
+        function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
         overlay.addEventListener('mousedown', (e) => {
             e.preventDefault();
             const r = overlay.getBoundingClientRect();
-            startX = e.clientX - r.left;
-            startY = e.clientY - r.top;
+            sx = clamp(e.clientX - r.left, 0, overlay.width);
+            sy = clamp(e.clientY - r.top,  0, overlay.height);
             drawing = true;
         });
 
         overlay.addEventListener('mousemove', (e) => {
             if (!drawing) return;
             const r = overlay.getBoundingClientRect();
-            const cx = e.clientX - r.left;
-            const cy = e.clientY - r.top;
+            const cx = clamp(e.clientX - r.left, 0, overlay.width);
+            const cy = clamp(e.clientY - r.top,  0, overlay.height);
             ctx.clearRect(0, 0, overlay.width, overlay.height);
             ctx.strokeStyle = '#00ff00';
             ctx.lineWidth = 2;
             ctx.setLineDash([6, 3]);
-            ctx.strokeRect(startX, startY, cx - startX, cy - startY);
+            ctx.strokeRect(sx, sy, cx - sx, cy - sy);
         });
 
         overlay.addEventListener('mouseup', (e) => {
             if (!drawing) return;
             drawing = false;
             const r = overlay.getBoundingClientRect();
-            const endX = e.clientX - r.left;
-            const endY = e.clientY - r.top;
+            const ex = clamp(e.clientX - r.left, 0, overlay.width);
+            const ey = clamp(e.clientY - r.top,  0, overlay.height);
 
-            if (Math.abs(endX - startX) < 5 && Math.abs(endY - startY) < 5) {
+            if (Math.abs(ex - sx) < 5 && Math.abs(ey - sy) < 5) {
                 ctx.clearRect(0, 0, overlay.width, overlay.height);
                 return;
             }
 
-            // The overlay now covers exactly the rendered image area,
-            // so the scale is simply naturalSize / overlaySize.
-            const scaleX = img.naturalWidth / overlay.width;
-            const scaleY = img.naturalHeight / overlay.height;
-            const x1 = Math.max(0, Math.round(Math.min(startX, endX) * scaleX));
-            const y1 = Math.max(0, Math.round(Math.min(startY, endY) * scaleY));
-            const x2 = Math.min(img.naturalWidth,  Math.round(Math.max(startX, endX) * scaleX));
-            const y2 = Math.min(img.naturalHeight, Math.round(Math.max(startY, endY) * scaleY));
+            // Since the image is pre-resized, naturalWidth == display width.
+            // Simple scale: display-pixel coords in the resized image.
+            const scX = img.naturalWidth  / overlay.width;
+            const scY = img.naturalHeight / overlay.height;
+            const x1 = Math.round(Math.min(sx, ex) * scX);
+            const y1 = Math.round(Math.min(sy, ey) * scY);
+            const x2 = Math.round(Math.max(sx, ex) * scX);
+            const y2 = Math.round(Math.max(sy, ey) * scY);
 
             window._drawnCoords = x1 + ', ' + y1 + ', ' + x2 + ', ' + y2;
 
-            // Keep the rectangle visible
+            // Persistent rectangle
             ctx.clearRect(0, 0, overlay.width, overlay.height);
-            const dx = Math.min(startX, endX), dy = Math.min(startY, endY);
-            const dw = Math.abs(endX - startX), dh = Math.abs(endY - startY);
+            const dx = Math.min(sx, ex), dy = Math.min(sy, ey);
+            const dw = Math.abs(ex - sx), dh = Math.abs(ey - sy);
             ctx.setLineDash([]);
             ctx.fillStyle = 'rgba(0, 255, 0, 0.12)';
             ctx.fillRect(dx, dy, dw, dh);
@@ -609,7 +630,7 @@ _BBOX_DRAW_JS = """
             ctx.fillText(label, dx + 4, ty);
             ctx.shadowBlur = 0;
 
-            // Update the readonly coords textbox so user sees what was drawn
+            // Update readonly coords textbox (best-effort)
             const coordsEl = document.querySelector('#coords-box textarea')
                           || document.querySelector('#coords-box input');
             if (coordsEl) {
@@ -712,7 +733,6 @@ def build_ui() -> gr.Blocks:
                         type="pil",
                         interactive=False,
                         elem_id="review-image-container",
-                        height=550,
                     )
                     # Add controls directly under the image
                     with gr.Row():
