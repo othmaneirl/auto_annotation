@@ -13,11 +13,9 @@ The UI exposes four tabs:
 
 from __future__ import annotations
 
-import io
 import json
 import logging
-import os
-import shutil
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -36,10 +34,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Lazy pipeline import (avoids heavy dependencies at module load for help text)
+# Lazy pipeline import
 # ---------------------------------------------------------------------------
 
-_pipeline: Optional[object] = None  # will be set to a Pipeline instance
+_pipeline: Optional[object] = None
 
 
 def _get_pipeline():
@@ -56,7 +54,7 @@ def _set_pipeline(p):
 # Helper: draw boxes on an image and return a PIL image
 # ---------------------------------------------------------------------------
 
-def _render_image(image_path: str, annotations: List[Dict]) -> Optional["PIL.Image.Image"]:  # type: ignore[name-defined]  # noqa: F821
+def _render_image(image_path: str, annotations: List[Dict]) -> Optional["PIL.Image.Image"]:
     try:
         from utils import draw_boxes
         return draw_boxes(image_path, annotations)
@@ -75,7 +73,6 @@ class SessionState:
     def __init__(self) -> None:
         self.review_images: List[str] = []
         self.current_index: int = 0
-        # annotations[image_path] = list of dicts {"bbox": [...], "class": str, "confidence": float}
         self.annotations: Dict[str, List[Dict]] = {}
         self.pipeline_running: bool = False
 
@@ -108,7 +105,6 @@ def setup_pipeline(
     model_name: str,
     conf_threshold: float,
 ) -> str:
-    """Initialise the pipeline and run the initial detection pass."""
     from pipeline import Pipeline, PipelineConfig
 
     unlabeled_dir = unlabeled_dir.strip()
@@ -154,133 +150,58 @@ def setup_pipeline(
 # ===========================================================================
 
 def _annotation_table(anns: List[Dict]) -> str:
-    """Convert annotation list to a readable markdown table."""
+    """Markdown table of annotations."""
     if not anns:
         return "_No annotations for this image._"
-    header = "| # | Class | Confidence | BBox (x1,y1,x2,y2) |\n|---|-------|-----------|--------------------|\n"
+    header = "| # | Class | Confidence | BBox (x1 y1 x2 y2) |\n|---|-------|-----------|---------------------|\n"
     rows = []
     for i, a in enumerate(anns):
         bbox = a.get("bbox", [])
         conf = a.get("confidence", "—")
         conf_str = f"{conf:.2f}" if isinstance(conf, float) else str(conf)
-        bbox_str = ", ".join(f"{v:.1f}" for v in bbox) if bbox else "—"
-        rows.append(f"| {i} | {a.get('class','?')} | {conf_str} | {bbox_str} |")
+        bbox_str = ", ".join(f"{v:.0f}" for v in bbox) if bbox else "—"
+        rows.append(f"| {i} | {a.get('class', '?')} | {conf_str} | {bbox_str} |")
     return header + "\n".join(rows)
 
 
-def review_load_current() -> Tuple:
-    """Return (image, annotation_table, progress_text, annotation_json)."""
-    img_path = _session.current_image()
-    if img_path is None:
-        return None, "_No images to review._", "0 / 0", "[]"
-
-    anns = _session.current_annotations()
-    rendered = _render_image(img_path, anns)
-    table = _annotation_table(anns)
-    progress = f"Image {_session.current_index + 1} / {len(_session.review_images)}"
-    ann_json = json.dumps(anns, indent=2)
-    return rendered, table, progress, ann_json
+def _annotation_choices(anns: List[Dict]) -> List[str]:
+    """Choices for the CheckboxGroup selector."""
+    choices = []
+    for i, a in enumerate(anns):
+        bbox = a.get("bbox", [])
+        conf = a.get("confidence", "—")
+        conf_str = f"{conf:.2f}" if isinstance(conf, float) else str(conf)
+        bbox_str = ", ".join(f"{v:.0f}" for v in bbox) if bbox else "—"
+        choices.append(f"#{i}: {a.get('class', '?')} ({conf_str}) [{bbox_str}]")
+    return choices
 
 
-def review_next() -> Tuple:
-    """Advance to the next image."""
-    if _session.current_index < len(_session.review_images) - 1:
-        _session.current_index += 1
-    return review_load_current()
+def _parse_anns(annotation_json: str) -> List[Dict]:
+    """Safely parse annotation JSON."""
+    try:
+        anns = json.loads(annotation_json)
+        return anns if isinstance(anns, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return _session.current_annotations()
 
 
-def review_prev() -> Tuple:
-    """Go back to the previous image."""
-    if _session.current_index > 0:
-        _session.current_index -= 1
-    return review_load_current()
-
-
-def save_and_next(annotation_json: str) -> Tuple:
-    """Parse the JSON, persist annotations, advance to next image."""
+def _save_to_pipeline(anns: List[Dict], img_path: str) -> None:
+    """Persist annotations to the pipeline."""
     p = _get_pipeline()
-    img_path = _session.current_image()
-    if img_path is None:
-        return review_load_current()
-
+    if p is None:
+        return
+    for ann in anns:
+        cls = ann.get("class", "").strip()
+        if cls:
+            try:
+                p.annotator.add_class(cls)
+            except Exception:
+                pass
     try:
-        anns = json.loads(annotation_json)
-        if not isinstance(anns, list):
-            anns = []
-    except json.JSONDecodeError:
-        anns = _session.current_annotations()
-
-    _session.set_current_annotations(anns)
-    if p is not None:
-        try:
-            p.save_user_annotations(img_path, anns)
-            p.mark_reviewed([img_path])
-        except Exception as exc:
-            logger.warning("Could not save annotations for %s: %s", img_path, exc)
-
-    return review_next()
-
-
-def delete_annotation(annotation_json: str, index: int) -> Tuple:
-    """Remove a single annotation by index."""
-    try:
-        anns = json.loads(annotation_json)
-        if not isinstance(anns, list):
-            anns = []
-    except json.JSONDecodeError:
-        anns = _session.current_annotations()
-
-    if 0 <= index < len(anns):
-        anns.pop(index)
-    _session.set_current_annotations(anns)
-    return _render_image(_session.current_image(), anns), _annotation_table(anns), json.dumps(anns, indent=2)
-
-
-def add_annotation(annotation_json: str, new_class: str, x1: float, y1: float, x2: float, y2: float) -> Tuple:
-    """Append a manually entered bounding box."""
-    try:
-        anns = json.loads(annotation_json)
-        if not isinstance(anns, list):
-            anns = []
-    except json.JSONDecodeError:
-        anns = _session.current_annotations()
-
-    new_ann = {"bbox": [x1, y1, x2, y2], "class": new_class.strip(), "confidence": 1.0}
-    anns.append(new_ann)
-
-    # Register class if pipeline is ready
-    p = _get_pipeline()
-    if p is not None and new_class.strip():
-        try:
-            p.annotator.add_class(new_class.strip())
-        except Exception:
-            pass
-
-    _session.set_current_annotations(anns)
-    return _render_image(_session.current_image(), anns), _annotation_table(anns), json.dumps(anns, indent=2)
-
-
-def change_class(annotation_json: str, index: int, new_class: str) -> Tuple:
-    """Change the class of an existing annotation."""
-    try:
-        anns = json.loads(annotation_json)
-        if not isinstance(anns, list):
-            anns = []
-    except json.JSONDecodeError:
-        anns = _session.current_annotations()
-
-    if 0 <= index < len(anns):
-        anns[index]["class"] = new_class.strip()
-
-    p = _get_pipeline()
-    if p is not None and new_class.strip():
-        try:
-            p.annotator.add_class(new_class.strip())
-        except Exception:
-            pass
-
-    _session.set_current_annotations(anns)
-    return _render_image(_session.current_image(), anns), _annotation_table(anns), json.dumps(anns, indent=2)
+        p.save_user_annotations(img_path, anns)
+        p.mark_reviewed([img_path])
+    except Exception as exc:
+        logger.warning("Could not save annotations for %s: %s", img_path, exc)
 
 
 def get_class_list() -> List[str]:
@@ -288,6 +209,165 @@ def get_class_list() -> List[str]:
     if p is None:
         return []
     return p.annotator.classes
+
+
+def review_load_current() -> Tuple:
+    """Return (image, table, progress, json, classes, checkbox_update)."""
+    img_path = _session.current_image()
+    if img_path is None:
+        return (
+            None,
+            "_No images to review._",
+            "0 / 0",
+            "[]",
+            "none",
+            gr.update(choices=[], value=[]),
+        )
+    anns = _session.current_annotations()
+    rendered = _render_image(img_path, anns)
+    table = _annotation_table(anns)
+    progress = f"Image {_session.current_index + 1} / {len(_session.review_images)}"
+    ann_json = json.dumps(anns, indent=2)
+    classes = ", ".join(get_class_list()) or "none"
+    choices = _annotation_choices(anns)
+    return rendered, table, progress, ann_json, classes, gr.update(choices=choices, value=[])
+
+
+def review_next() -> Tuple:
+    if _session.current_index < len(_session.review_images) - 1:
+        _session.current_index += 1
+    return review_load_current()
+
+
+def review_prev() -> Tuple:
+    if _session.current_index > 0:
+        _session.current_index -= 1
+    return review_load_current()
+
+
+def save_and_next(annotation_json: str) -> Tuple:
+    """Save current annotations and advance."""
+    img_path = _session.current_image()
+    if img_path is None:
+        return review_load_current()
+
+    anns = _parse_anns(annotation_json)
+    _session.set_current_annotations(anns)
+    _save_to_pipeline(anns, img_path)
+    return review_next()
+
+
+def save_current(annotation_json: str) -> Tuple:
+    """Save without advancing. Returns (status, image, table, json, checkbox_update)."""
+    img_path = _session.current_image()
+    if img_path is None:
+        return (
+            "No image loaded.",
+            None,
+            "_No images to review._",
+            "[]",
+            gr.update(choices=[], value=[]),
+        )
+    anns = _parse_anns(annotation_json)
+    _session.set_current_annotations(anns)
+    _save_to_pipeline(anns, img_path)
+
+    rendered = _render_image(img_path, anns)
+    choices = _annotation_choices(anns)
+    return (
+        f"✅ Saved {len(anns)} annotation(s).",
+        rendered,
+        _annotation_table(anns),
+        json.dumps(anns, indent=2),
+        gr.update(choices=choices, value=[]),
+    )
+
+
+def _edit_result(anns: List[Dict]) -> Tuple:
+    """Common return after any edit operation: (image, table, json, checkbox_update)."""
+    _session.set_current_annotations(anns)
+    rendered = _render_image(_session.current_image(), anns)
+    choices = _annotation_choices(anns)
+    return (
+        rendered,
+        _annotation_table(anns),
+        json.dumps(anns, indent=2),
+        gr.update(choices=choices, value=[]),
+    )
+
+
+def delete_annotations(annotation_json: str, selected: List[str]) -> Tuple:
+    """Remove all selected annotations (multi-select from CheckboxGroup)."""
+    anns = _parse_anns(annotation_json)
+    # Extract indices from strings like "#0: cat (0.85) [...]"
+    indices = set()
+    for s in (selected or []):
+        m = re.match(r"#(\d+)", s)
+        if m:
+            indices.add(int(m.group(1)))
+    # Remove in reverse order to keep indices valid
+    for idx in sorted(indices, reverse=True):
+        if 0 <= idx < len(anns):
+            anns.pop(idx)
+    return _edit_result(anns)
+
+
+def add_annotation(annotation_json: str, new_class: str, coords_str: str) -> Tuple:
+    """Add a bbox from drawn/typed coordinates.
+
+    coords_str is "x1, y1, x2, y2" (comma-separated).
+    """
+    anns = _parse_anns(annotation_json)
+
+    # Parse coordinates
+    parts = [p.strip() for p in coords_str.replace(";", ",").split(",") if p.strip()]
+    if len(parts) < 4:
+        # Not enough coordinates — return unchanged
+        return _edit_result(anns)
+    try:
+        x1, y1, x2, y2 = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+    except ValueError:
+        return _edit_result(anns)
+
+    cls = new_class.strip() if new_class else "object"
+    new_ann = {"bbox": [x1, y1, x2, y2], "class": cls, "confidence": 1.0}
+    anns.append(new_ann)
+
+    p = _get_pipeline()
+    if p is not None and cls:
+        try:
+            p.annotator.add_class(cls)
+        except Exception:
+            pass
+
+    return _edit_result(anns)
+
+
+def change_classes(annotation_json: str, selected: List[str], new_class: str) -> Tuple:
+    """Change the class for all selected annotations."""
+    anns = _parse_anns(annotation_json)
+    cls = new_class.strip() if new_class else ""
+    if not cls:
+        return _edit_result(anns)
+
+    indices = set()
+    for s in (selected or []):
+        m = re.match(r"#(\d+)", s)
+        if m:
+            indices.add(int(m.group(1)))
+
+    for idx in indices:
+        if 0 <= idx < len(anns):
+            anns[idx]["class"] = cls
+
+    p = _get_pipeline()
+    if p is not None and cls:
+        try:
+            p.annotator.add_class(cls)
+        except Exception:
+            pass
+
+    return _edit_result(anns)
 
 
 # ===========================================================================
@@ -397,19 +477,192 @@ def export_model() -> Optional[str]:
 
 
 # ===========================================================================
+# JavaScript: canvas overlay for drawing bboxes on the image
+# ===========================================================================
+
+_BBOX_DRAW_JS = """
+() => {
+    if (window._bboxCanvasReady) return;
+    window._bboxCanvasReady = true;
+    window._drawnCoords = '';
+
+    // Compute the actual rendered image area inside the <img> element,
+    // accounting for object-fit: contain letterboxing.
+    function getRenderedRect(img) {
+        const iw = img.naturalWidth, ih = img.naturalHeight;
+        const el = img.getBoundingClientRect();
+        const ew = el.width, eh = el.height;
+        const imgAR = iw / ih, elAR = ew / eh;
+        let rw, rh, ox, oy;
+        if (imgAR > elAR) {
+            rw = ew;  rh = ew / imgAR;
+            ox = 0;   oy = (eh - rh) / 2;
+        } else {
+            rh = eh;  rw = eh * imgAR;
+            oy = 0;   ox = (ew - rw) / 2;
+        }
+        return { rw, rh, ox, oy, elLeft: el.left, elTop: el.top };
+    }
+
+    function setupOverlay() {
+        const container = document.querySelector('#review-image-container');
+        if (!container) { setTimeout(setupOverlay, 500); return; }
+
+        const img = container.querySelector('img');
+        if (!img || !img.complete || img.naturalWidth === 0) {
+            setTimeout(setupOverlay, 300);
+            return;
+        }
+
+        // Remove old overlay
+        const old = document.getElementById('bbox-overlay');
+        if (old) old.remove();
+
+        const overlay = document.createElement('canvas');
+        overlay.id = 'bbox-overlay';
+        overlay.style.pointerEvents = 'all';
+        overlay.style.cursor = 'crosshair';
+        overlay.style.zIndex = '100';
+
+        const imgWrapper = img.parentElement;
+        imgWrapper.style.position = 'relative';
+
+        function positionCanvas() {
+            const elRect = img.getBoundingClientRect();
+            const wrapRect = imgWrapper.getBoundingClientRect();
+            const rr = getRenderedRect(img);
+            // Position overlay exactly over the rendered image content
+            overlay.style.position = 'absolute';
+            overlay.style.left = (elRect.left - wrapRect.left + rr.ox) + 'px';
+            overlay.style.top = (elRect.top - wrapRect.top + rr.oy) + 'px';
+            overlay.width = Math.round(rr.rw);
+            overlay.height = Math.round(rr.rh);
+            overlay.style.width = rr.rw + 'px';
+            overlay.style.height = rr.rh + 'px';
+        }
+        positionCanvas();
+        imgWrapper.appendChild(overlay);
+
+        const ctx = overlay.getContext('2d');
+        let drawing = false, startX = 0, startY = 0;
+
+        overlay.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            const r = overlay.getBoundingClientRect();
+            startX = e.clientX - r.left;
+            startY = e.clientY - r.top;
+            drawing = true;
+        });
+
+        overlay.addEventListener('mousemove', (e) => {
+            if (!drawing) return;
+            const r = overlay.getBoundingClientRect();
+            const cx = e.clientX - r.left;
+            const cy = e.clientY - r.top;
+            ctx.clearRect(0, 0, overlay.width, overlay.height);
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([6, 3]);
+            ctx.strokeRect(startX, startY, cx - startX, cy - startY);
+        });
+
+        overlay.addEventListener('mouseup', (e) => {
+            if (!drawing) return;
+            drawing = false;
+            const r = overlay.getBoundingClientRect();
+            const endX = e.clientX - r.left;
+            const endY = e.clientY - r.top;
+
+            if (Math.abs(endX - startX) < 5 && Math.abs(endY - startY) < 5) {
+                ctx.clearRect(0, 0, overlay.width, overlay.height);
+                return;
+            }
+
+            // The overlay now covers exactly the rendered image area,
+            // so the scale is simply naturalSize / overlaySize.
+            const scaleX = img.naturalWidth / overlay.width;
+            const scaleY = img.naturalHeight / overlay.height;
+            const x1 = Math.max(0, Math.round(Math.min(startX, endX) * scaleX));
+            const y1 = Math.max(0, Math.round(Math.min(startY, endY) * scaleY));
+            const x2 = Math.min(img.naturalWidth,  Math.round(Math.max(startX, endX) * scaleX));
+            const y2 = Math.min(img.naturalHeight, Math.round(Math.max(startY, endY) * scaleY));
+
+            window._drawnCoords = x1 + ', ' + y1 + ', ' + x2 + ', ' + y2;
+
+            // Keep the rectangle visible
+            ctx.clearRect(0, 0, overlay.width, overlay.height);
+            const dx = Math.min(startX, endX), dy = Math.min(startY, endY);
+            const dw = Math.abs(endX - startX), dh = Math.abs(endY - startY);
+            ctx.setLineDash([]);
+            ctx.fillStyle = 'rgba(0, 255, 0, 0.12)';
+            ctx.fillRect(dx, dy, dw, dh);
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(dx, dy, dw, dh);
+
+            ctx.fillStyle = '#00ff00';
+            ctx.font = 'bold 13px monospace';
+            ctx.shadowColor = 'rgba(0,0,0,0.7)';
+            ctx.shadowBlur = 3;
+            const label = '[' + x1 + ', ' + y1 + ', ' + x2 + ', ' + y2 + ']';
+            const ty = dy > 20 ? dy - 6 : dy + dh + 16;
+            ctx.fillText(label, dx + 4, ty);
+            ctx.shadowBlur = 0;
+
+            // Update the readonly coords textbox so user sees what was drawn
+            const coordsEl = document.querySelector('#coords-box textarea')
+                          || document.querySelector('#coords-box input');
+            if (coordsEl) {
+                try {
+                    const proto = coordsEl.tagName === 'TEXTAREA'
+                        ? HTMLTextAreaElement : HTMLInputElement;
+                    Object.getOwnPropertyDescriptor(proto.prototype, 'value')
+                        .set.call(coordsEl, window._drawnCoords);
+                    coordsEl.dispatchEvent(new Event('input', { bubbles: true }));
+                } catch(err) {}
+            }
+        });
+
+        new ResizeObserver(() => positionCanvas()).observe(img);
+    }
+
+    const observer = new MutationObserver(() => setTimeout(setupOverlay, 200));
+    const target = document.querySelector('#review-image-container');
+    if (target) {
+        observer.observe(target, { childList: true, subtree: true, attributes: true });
+    }
+    setTimeout(setupOverlay, 500);
+}
+"""
+
+# JS snippet for the Add button: injects window._drawnCoords into the
+# coords input before the Python callback runs.
+_ADD_BTN_JS = """
+(ann_json, cls, coords) => {
+    const drawn = window._drawnCoords;
+    if (drawn && drawn.length > 0) {
+        window._drawnCoords = '';  // consumed
+        return [ann_json, cls, drawn];
+    }
+    return [ann_json, cls, coords];
+}
+"""
+
+
+# ===========================================================================
 # Build the Gradio UI
 # ===========================================================================
 
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Auto-Annotation Pipeline") as demo:
         gr.Markdown(
-            """
-# 🤖 Active Learning Auto-Annotation Pipeline
-
-Annotate object-detection datasets using pretrained YOLO + human-in-the-loop refinement.
-            """
+            "# 🤖 Active Learning Auto-Annotation Pipeline\n\n"
+            "Annotate object-detection datasets using pretrained YOLO + human-in-the-loop refinement."
         )
 
+        # ---------------------------------------------------------------
+        # Tab 1 – Setup
+        # ---------------------------------------------------------------
         with gr.Tab("⚙️ Setup & Import"):
             gr.Markdown("### 1. Configure the pipeline")
             with gr.Row():
@@ -425,141 +678,173 @@ Annotate object-detection datasets using pretrained YOLO + human-in-the-loop ref
                 )
                 conf_slider = gr.Slider(
                     label="Confidence threshold",
-                    minimum=0.05,
-                    maximum=0.95,
-                    step=0.05,
-                    value=0.25,
+                    minimum=0.05, maximum=0.95, step=0.05, value=0.25,
                 )
             start_btn = gr.Button("🚀 Start Initial Detection", variant="primary")
             setup_log = gr.Textbox(label="Status", lines=6, interactive=False)
-
             start_btn.click(
                 fn=setup_pipeline,
                 inputs=[unlabeled_dir_input, model_choice, conf_slider],
                 outputs=[setup_log],
             )
 
-        with gr.Tab("🖊️ Review & Annotate"):
+        # ---------------------------------------------------------------
+        # Tab 2 – Review & Annotate
+        # ---------------------------------------------------------------
+        with gr.Tab("🖊️ Review & Annotate") as review_tab:
             gr.Markdown(
-                "Review detected bounding boxes, correct classes, delete false positives, "
-                "or add missing boxes."
+                "**🖱️ Draw a box** on the image by clicking & dragging. "
+                "The rectangle stays visible and coordinates auto-fill. "
+                "Type a class name and click **➕ Add**.\n\n"
+                "**Select annotations** with the checkboxes below the table "
+                "to **🗑 Delete** or **✏️ Change Class** in batch."
             )
+
             with gr.Row():
                 progress_text = gr.Textbox(label="Progress", interactive=False, scale=1)
                 class_list_display = gr.Textbox(label="Known classes", interactive=False, scale=3)
 
+            # --- Image + Add controls + Table ---
             with gr.Row():
-                annotated_image = gr.Image(label="Current image", type="pil", interactive=False)
+                with gr.Column(scale=3):
+                    annotated_image = gr.Image(
+                        label="Current image — click & drag to draw a box",
+                        type="pil",
+                        interactive=False,
+                        elem_id="review-image-container",
+                        height=550,
+                    )
+                    # Add controls directly under the image
+                    with gr.Row():
+                        new_class = gr.Textbox(
+                            label="Class name",
+                            placeholder="e.g. cat",
+                            scale=3,
+                        )
+                        coords_box = gr.Textbox(
+                            label="Drawn coords",
+                            placeholder="draw on image",
+                            interactive=False,
+                            elem_id="coords-box",
+                            scale=2,
+                        )
+                        add_btn = gr.Button(
+                            "➕ Add",
+                            variant="primary",
+                            scale=1,
+                            min_width=80,
+                        )
+                with gr.Column(scale=2):
+                    annotation_table_md = gr.Markdown("_No image loaded._")
 
-            annotation_table_md = gr.Markdown("_No image loaded._")
-            annotation_json = gr.Textbox(
-                label="Annotations JSON (editable)",
-                lines=12,
-                placeholder='[{"bbox": [x1,y1,x2,y2], "class": "cat", "confidence": 0.9}]',
-            )
-
+            # --- Navigation ---
             with gr.Row():
                 prev_btn = gr.Button("⬅ Previous")
+                save_btn = gr.Button("💾 Save", variant="secondary")
                 save_next_btn = gr.Button("💾 Save & Next", variant="primary")
                 next_btn = gr.Button("Next ➡")
 
-            gr.Markdown("#### Modify annotations")
-            with gr.Row():
-                del_index = gr.Number(label="Delete annotation #", value=0, precision=0)
-                del_btn = gr.Button("🗑 Delete")
-            with gr.Row():
-                chg_index = gr.Number(label="Change class of annotation #", value=0, precision=0)
-                chg_class = gr.Textbox(label="New class name", placeholder="dog")
-                chg_btn = gr.Button("✏️ Change Class")
-            gr.Markdown("#### Add new annotation")
-            with gr.Row():
-                new_class = gr.Textbox(label="Class name", placeholder="cat")
-                x1_in = gr.Number(label="x1", value=0)
-                y1_in = gr.Number(label="y1", value=0)
-                x2_in = gr.Number(label="x2", value=100)
-                y2_in = gr.Number(label="y2", value=100)
-            add_btn = gr.Button("➕ Add Annotation")
+            save_status = gr.Textbox(label="Status", interactive=False, lines=1)
 
-            # Wire navigation buttons
-            prev_btn.click(
-                fn=review_prev,
-                outputs=[annotated_image, annotation_table_md, progress_text, annotation_json],
+            # --- Selection-based edit / delete ---
+            gr.Markdown("---")
+            gr.Markdown(
+                "#### ✏️ Edit / 🗑 Delete\n"
+                "*Select one or more annotations below, then click Delete or Change Class.*"
             )
-            next_btn.click(
-                fn=review_next,
-                outputs=[annotated_image, annotation_table_md, progress_text, annotation_json],
+            ann_checkbox = gr.CheckboxGroup(
+                label="Select annotations",
+                choices=[],
+                value=[],
+                elem_id="ann-selector",
             )
-            save_next_btn.click(
-                fn=save_and_next,
-                inputs=[annotation_json],
-                outputs=[annotated_image, annotation_table_md, progress_text, annotation_json],
+            with gr.Row():
+                chg_class = gr.Textbox(label="New class name", placeholder="dog", scale=2)
+                chg_btn = gr.Button("✏️ Change Class of Selected", scale=1)
+                del_btn = gr.Button("🗑 Delete Selected", variant="stop", scale=1)
+
+            # --- Raw JSON (advanced) ---
+            annotation_json = gr.Textbox(
+                label="Annotations JSON (advanced — editable)",
+                lines=6,
+                visible=True,
             )
+
+            # --- Wire events ---
+            _review_outputs = [
+                annotated_image,
+                annotation_table_md,
+                progress_text,
+                annotation_json,
+                class_list_display,
+                ann_checkbox,
+            ]
+
+            review_tab.select(fn=review_load_current, outputs=_review_outputs)
+
+            load_btn = gr.Button("🔄 Reload current image")
+            load_btn.click(fn=review_load_current, outputs=_review_outputs)
+            prev_btn.click(fn=review_prev, outputs=_review_outputs)
+            next_btn.click(fn=review_next, outputs=_review_outputs)
+            save_next_btn.click(fn=save_and_next, inputs=[annotation_json], outputs=_review_outputs)
+
+            _save_outputs = [save_status, annotated_image, annotation_table_md, annotation_json, ann_checkbox]
+            save_btn.click(fn=save_current, inputs=[annotation_json], outputs=_save_outputs)
+
+            _edit_outputs = [annotated_image, annotation_table_md, annotation_json, ann_checkbox]
             del_btn.click(
-                fn=delete_annotation,
-                inputs=[annotation_json, del_index],
-                outputs=[annotated_image, annotation_table_md, annotation_json],
+                fn=delete_annotations,
+                inputs=[annotation_json, ann_checkbox],
+                outputs=_edit_outputs,
             )
             chg_btn.click(
-                fn=change_class,
-                inputs=[annotation_json, chg_index, chg_class],
-                outputs=[annotated_image, annotation_table_md, annotation_json],
+                fn=change_classes,
+                inputs=[annotation_json, ann_checkbox, chg_class],
+                outputs=_edit_outputs,
             )
             add_btn.click(
                 fn=add_annotation,
-                inputs=[annotation_json, new_class, x1_in, y1_in, x2_in, y2_in],
-                outputs=[annotated_image, annotation_table_md, annotation_json],
+                inputs=[annotation_json, new_class, coords_box],
+                outputs=_edit_outputs,
+                js=_ADD_BTN_JS,
             )
 
-            # Refresh class list on tab focus (approximated via a button)
             refresh_classes_btn = gr.Button("🔄 Refresh class list")
             refresh_classes_btn.click(
                 fn=lambda: ", ".join(get_class_list()) or "none",
                 outputs=[class_list_display],
             )
 
-            # Load first image button
-            load_btn = gr.Button("📂 Load current image")
-            load_btn.click(
-                fn=review_load_current,
-                outputs=[annotated_image, annotation_table_md, progress_text, annotation_json],
-            )
+            # Inject the canvas-overlay drawing JS
+            demo.load(fn=None, js=_BBOX_DRAW_JS)
 
+        # ---------------------------------------------------------------
+        # Tab 3 – Training & Auto-Annotation
+        # ---------------------------------------------------------------
         with gr.Tab("🏋️ Training & Auto-Annotation"):
             gr.Markdown("Fine-tune the model on corrected data, then auto-annotate remaining images.")
-
             with gr.Row():
                 epochs_input = gr.Number(label="Epochs (0 = auto)", value=0, precision=0)
                 device_input = gr.Textbox(label="Device (blank = auto)", placeholder="cpu")
-
             train_btn = gr.Button("🚂 Fine-tune Model", variant="primary")
             train_output = gr.Textbox(label="Training log", lines=8, interactive=False)
-
             auto_btn = gr.Button("🤖 Run Auto-Annotation & Select Uncertain Images")
             auto_output = gr.Textbox(label="Auto-annotation log", lines=8, interactive=False)
-
             summary_btn = gr.Button("📊 Refresh Pipeline Summary")
             summary_output = gr.Markdown("_Click 'Refresh Pipeline Summary' to update._")
 
-            train_btn.click(
-                fn=run_training,
-                inputs=[epochs_input, device_input],
-                outputs=[train_output],
-            )
-            auto_btn.click(
-                fn=run_auto_annotation,
-                outputs=[auto_output],
-            )
-            summary_btn.click(
-                fn=pipeline_summary,
-                outputs=[summary_output],
-            )
+            train_btn.click(fn=run_training, inputs=[epochs_input, device_input], outputs=[train_output])
+            auto_btn.click(fn=run_auto_annotation, outputs=[auto_output])
+            summary_btn.click(fn=pipeline_summary, outputs=[summary_output])
 
+        # ---------------------------------------------------------------
+        # Tab 4 – Export
+        # ---------------------------------------------------------------
         with gr.Tab("📦 Export"):
             gr.Markdown("Download your annotations and the trained model.")
             export_ann_btn = gr.Button("📥 Export Annotations (ZIP)")
             ann_file = gr.File(label="Annotations ZIP")
             export_ann_btn.click(fn=export_annotations, outputs=[ann_file])
-
             export_model_btn = gr.Button("📥 Export Trained Model")
             model_file = gr.File(label="Trained model (.pt)")
             export_model_btn.click(fn=export_model, outputs=[model_file])
@@ -575,8 +860,6 @@ if __name__ == "__main__":
     demo = build_ui()
     demo.launch(
         share=False,
-        # Bind to all interfaces so the app is reachable from other machines
-        # on the same network.  Change to "127.0.0.1" for local-only access.
-        server_name="0.0.0.0",
+        server_name="127.0.0.1",
         server_port=7860,
     )
